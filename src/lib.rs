@@ -1,19 +1,23 @@
 #![feature(iter_partition_in_place)]
 
+pub mod format;
 pub mod sppf;
 
-use std::{collections::HashMap, ops::Range, fmt};
-use crate::sppf::{SPPF, SPPFNode, ShowProd};
-use smallvec::SmallVec;
+use std::{collections::HashMap, ops::Range};
+use crate::{sppf::*, format::*};
+use smallvec::{smallvec, SmallVec};
 
 #[derive(Eq, Copy, Clone)]
 pub struct Item<'a> {
-  prod: &'a [u32],
-  dot: u32,
-  orig: u32,
+  pub prod: &'a [u32],
+  pub dot: u32,
+  pub orig: u32,
 }
 
-// compare production array using pointer, because their contents are unique
+// the dp chart type
+pub type Chart<'a> = Vec<Vec<Item<'a>>>;
+
+// compare production array using pointer, because each prod is considered unique
 impl PartialEq for Item<'_> {
   fn eq(&self, other: &Self) -> bool {
     self.prod.as_ptr() == other.prod.as_ptr() && self.dot == other.dot && self.orig == other.orig
@@ -22,38 +26,75 @@ impl PartialEq for Item<'_> {
 
 pub struct Parser<'a> {
   // prod[0] == lhs
-  prods: Vec<Vec<u32>>,
+  pub(crate) prods: Vec<SmallVec<[u32; 4]>>,
   // 0..#non-terminals is non-terminal, #non-terminals..#tokens is terminal
-  tokens: HashMap<&'a str, u32>,
+  pub(crate) tokens: HashMap<&'a str, u32>,
   // nullable.len() == #non-terminals, which is recorded **nowhere else**
-  nullable: Vec<bool>,
-}
-
-impl fmt::Display for Parser<'_> {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    let id2token = self.id2token();
-    for prod in &self.prods { writeln!(f, "{}", ShowProd(&id2token, prod))?; }
-    Ok(())
-  }
+  pub(crate) nullable: Vec<bool>,
 }
 
 #[inline(always)]
-unsafe fn split1(x: &[u32]) -> (usize, &[u32]) { (*x.get_unchecked(0) as usize, x.get_unchecked(1..)) }
+unsafe fn split1(x: &[u32]) -> (u32, &[u32]) {
+  debug_assert!(!x.is_empty());
+  (*x.get_unchecked(0), x.get_unchecked(1..))
+}
+
+// according to document, `slice::get_unchecked` can't perform `debug_assert`
+#[inline(always)]
+unsafe fn get<T>(x: &[T], i: u32) -> &T {
+  debug_assert!(i < x.len() as u32);
+  x.get_unchecked(i as usize)
+}
+
+#[inline(always)]
+unsafe fn get_mut<T>(x: &mut [T], i: u32) -> &mut T {
+  debug_assert!(i < x.len() as u32);
+  x.get_unchecked_mut(i as usize)
+}
+
+// getters
+impl<'a> Parser<'a> {
+  #[inline(always)]
+  pub fn prods(&self) -> &Vec<SmallVec<[u32; 4]>> { &self.prods }
+  #[inline(always)]
+  pub fn tokens(&self) -> &HashMap<&'a str, u32> { &self.tokens }
+  #[inline(always)]
+  pub fn nullable(&self) -> &Vec<bool> { &self.nullable }
+  #[inline(always)]
+  pub fn token_id(&self, t: &str) -> Option<u32> { self.tokens.get(t).copied() }
+  #[inline(always)]
+  pub fn terminal_id(&self, t: &str) -> Option<u32> { self.token_id(t).filter(|&x| x >= self.nullable.len() as u32) }
+  #[inline(always)]
+  pub fn non_terminal_id(&self, t: &str) -> Option<u32> { self.token_id(t).filter(|&x| x < self.nullable.len() as u32) }
+
+  pub fn id2token(&self) -> Vec<&str> {
+    unsafe {
+      let mut ret = Vec::with_capacity(self.tokens.len());
+      ret.set_len(self.tokens.len());
+      for (&k, &v) in &self.tokens { *get_mut(&mut ret, v) = k; }
+      ret
+    }
+  }
+}
 
 impl Parser<'_> {
-  pub fn from_rules(rules: &str) -> Option<Parser> {
+  pub fn from_rules(rules: &str) -> Result<Parser, ParseRulesError> {
     let (mut prods, mut tokens) = (Vec::new(), HashMap::new());
-    let lines = rules.lines().filter(|rule| !rule.trim().is_empty());
-    for rule in lines.clone() {
+    let lines = rules.lines().enumerate().filter(|(_, rule)| {
+      let rule = rule.trim();
+      !rule.is_empty() && !rule.starts_with('#') // comment line start with #
+    });
+    for (line, rule) in lines.clone() {
       let mut sp = rule.split_whitespace();
-      let lhs = sp.next()?;
+      let lhs = sp.next().ok_or(ParseRulesError(line + 1))?;
       let id = tokens.len() as u32;
-      prods.push(vec![*tokens.entry(lhs).or_insert(id)]);
+      prods.push(smallvec![*tokens.entry(lhs).or_insert(id)]);
     }
+    if prods.is_empty() { return Err(ParseRulesError(0)); }
     let mut nullable = vec![false; tokens.len()];
-    for (rule, prod) in lines.zip(prods.iter_mut()) {
+    for ((line, rule), prod) in lines.zip(prods.iter_mut()) {
       let mut sp = rule.split_whitespace();
-      match sp.nth(1) { Some("->") => {} _ => return None };
+      match sp.nth(1) { Some("->") => {} _ => return Err(ParseRulesError(line + 1)) };
       for rhs in sp {
         let id = tokens.len() as u32;
         prod.push(*tokens.entry(rhs).or_insert(id));
@@ -64,40 +105,36 @@ impl Parser<'_> {
         let mut changed = false;
         for p in &prods {
           let (lhs, rhs) = split1(p);
-          if *nullable.get_unchecked(lhs) { continue; }
-          if rhs.iter().all(|r| nullable.get(*r as usize).copied().unwrap_or(false)) {
-            *nullable.get_unchecked_mut(lhs) = true;
+          if *get(&nullable, lhs) { continue; }
+          if rhs.iter().all(|&r| nullable.get(r as usize).copied().unwrap_or(false)) {
+            *get_mut(&mut nullable, lhs) = true;
             changed = true;
           }
         }
         if !changed { break; }
       }
     }
-    Some(Parser { prods, tokens, nullable })
+    Ok(Parser { prods, tokens, nullable })
   }
 
-  pub fn id2token(&self) -> Vec<&str> {
-    let mut ret = vec![""; self.tokens.len()];
-    for (&k, &v) in &self.tokens { ret[v as usize] = k; }
-    ret
-  }
-
-  pub fn parse<'a>(&self, string: impl IntoIterator<Item=&'a str>, start: &str) -> Result<SPPF, &'static str> {
+  // return Err only when input/start contains undefined terminal/non-terminal
+  // so returning Ok doesn't mean the parse succeeds
+  // `SPPF::next` will return a sequence of possible trees, so the parse succeeds when it returns anything
+  pub fn parse<'a, 'b>(&'a self, input: impl IntoIterator<Item=&'b str>, start: &'b str) -> Result<(Chart<'a>, SPPF), ParseError<'b>> {
     let mut tokens = Vec::new();
-    let nt_num = self.nullable.len() as u32;
-    for t in string {
-      tokens.push(self.tokens.get(t).copied().filter(|&x| x >= nt_num).ok_or("no such terminal")?);
+    for t in input {
+      tokens.push(self.terminal_id(t).ok_or(ParseError(t))?);
     }
-    let start = self.tokens.get(start).copied().filter(|&x| x < nt_num).ok_or("no such non-terminal")?;
+    let start = self.non_terminal_id(start).ok_or(ParseError(start))?;
     Ok(unsafe { self.do_parse(tokens, start) })
   }
 
-  unsafe fn do_parse(&self, tokens: Vec<u32>, start: u32) -> SPPF {
+  unsafe fn do_parse(&self, tokens: Vec<u32>, start: u32) -> (Chart, SPPF) {
     let nt_num = self.nullable.len() as u32;
     let mut sets = vec![Vec::new(); tokens.len() + 1];
     let p = sets.as_mut_ptr();
     for prod in &self.prods {
-      if *prod.get_unchecked(0) == start {
+      if *get(prod, 0) == start {
         // dot = 1 is start position, because [0] is lhs
         (*p).push(Item { prod, dot: 1, orig: 0 });
       }
@@ -113,14 +150,14 @@ impl Parser<'_> {
         if let Some(&nxt) = prod.get(dot as usize) {
           if nxt < nt_num { // is a non-terminal
             for prod in &self.prods { // PREDICATE step
-              if *prod.get_unchecked(0) == nxt {
+              if *get(prod, 0) == nxt {
                 set_add(si, Item { prod, dot: 1, orig: i as u32 });
               }
             }
             // this is a modification (or say correction) to the original earley parser
             // a nullable non-terminal A can be advanced without seeing A -> string. during PREDICATE step
             // for more detail, see https://courses.engr.illinois.edu/cs421/sp2012/project/PracticalEarleyParsing.pdf
-            if *self.nullable.get_unchecked(nxt as usize) {
+            if *get(&self.nullable, nxt) {
               set_add(si, Item { prod, dot: dot + 1, orig });
             }
           } else if token == Some(nxt) { // is a terminal, SCAN step
@@ -130,7 +167,7 @@ impl Parser<'_> {
             (*p.add(i + 1)).push(Item { prod, dot: dot + 1, orig });
           }
         } else { // COMPLETE step
-          let lhs = *prod.get_unchecked(0);
+          let lhs = *get(&prod, 0);
           // caution: it is possible that i == orig, so can't use iterator
           // the semantics of this step is just iterating over those already in the sets
           let orig = &*p.add(orig as usize);
@@ -148,8 +185,8 @@ impl Parser<'_> {
     let mut complete = vec![Vec::new(); tokens.len() + 1];
     for (idx, set) in sets.iter().enumerate() {
       for &Item { prod, dot, orig } in set {
-        if prod.len() == dot as usize {
-          complete.get_unchecked_mut(orig as usize).push(Item { prod, dot, orig: idx as u32 });
+        if prod.len() as u32 == dot {
+          get_mut(&mut complete, orig).push(Item { prod, dot, orig: idx as u32 });
         }
       }
     }
@@ -168,7 +205,7 @@ impl Parser<'_> {
         if let Some(&x) = self.prod.get(cur) {
           if x < self.nt_num {
             for (idx, it) in (*self.complete.as_ptr().add(start)).iter().enumerate() {
-              if *it.prod.get_unchecked(0) == x {
+              if *get(it.prod, 0) == x {
                 self.path.push((start as u32, idx as u32));
                 self.dfs(cur + 1, it.orig as usize);
                 self.path.pop();
@@ -185,16 +222,16 @@ impl Parser<'_> {
           let mut cur = self.range.start;
           for &(state, idx) in &self.path {
             if state != !0 {
-              let &Item { prod, orig, .. } = (*self.complete.as_ptr().add(state as usize)).get_unchecked(idx as usize);
-              ch.push(self.sppf.find(prod, cur..orig) as u32);
+              let &Item { prod, orig, .. } = get(get::<Vec<_>>(&self.complete, state), idx);
+              ch.push(self.sppf.find(prod, cur..orig));
               cur = orig;
             } else {
-              ch.push(self.sppf.find(&[], cur..cur) as u32);
+              ch.push(self.sppf.find(&[], cur..cur));
               cur += 1;
             }
           }
           if cur == self.range.end {
-            self.sppf.nodes.get_unchecked_mut(node).children.push(ch);
+            get_mut(&mut self.sppf.nodes, node).children.push(ch);
           }
         }
       }
@@ -202,7 +239,7 @@ impl Parser<'_> {
 
     let mut ctx = DfsCtx { range: 0..tokens.len() as u32, nt_num, complete, prod: &[], path: Vec::new(), sppf: SPPF { parser: self, start, tokens, nodes: Vec::new() } };
     for &Item { prod, orig, .. } in &*ctx.complete.as_ptr() {
-      if *prod.get_unchecked(0) == start && orig == ctx.sppf.tokens.len() as u32 {
+      if *get(prod, 0) == start && orig == ctx.sppf.tokens.len() as u32 {
         ctx.prod = prod;
         ctx.dfs(1, 0);
       }
@@ -223,10 +260,9 @@ impl Parser<'_> {
     // in this way the dfs on sppf can generate trees from short to tall, instead of insisting on a infinite tall tree
     for n in &mut ctx.sppf.nodes {
       if n.children.len() >= 1 { // this if is not necessary, just save some work
-        n.children.iter_mut().partition_in_place(|ch|
-          ch.iter().all(|x| (*nodes.add(*x as usize)).children.is_empty()));
+        n.children.iter_mut().partition_in_place(|ch| ch.iter().all(|&x| (*nodes.add(x as usize)).children.is_empty()));
       }
     }
-    ctx.sppf
+    (sets, ctx.sppf)
   }
 }

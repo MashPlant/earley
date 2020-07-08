@@ -1,14 +1,14 @@
-use std::{ops::Range, fmt::{self, Write}};
+use std::ops::Range;
 use smallvec::{smallvec, SmallVec};
-use crate::{Parser, split1};
+use crate::{Parser, split1, get, get_mut};
 
 pub struct SPPFNode<'a> {
   // for non-terminal, prod[0] is always lhs, so prod is never empty
   // for terminal, prod is empty, range.start == range.end == position of this token, children is empty
-  pub(crate) prod: &'a [u32],
-  pub(crate) range: Range<u32>,
+  pub prod: &'a [u32],
+  pub range: Range<u32>,
   // use index in Vec as pointers; Rc is not suitable, because there may be cycles
-  pub(crate) children: SmallVec<[SmallVec<[u32; 4]>; 1]>,
+  pub children: SmallVec<[SmallVec<[u32; 4]>; 1]>,
 }
 
 pub struct SPPF<'a> {
@@ -19,40 +19,29 @@ pub struct SPPF<'a> {
   pub(crate) nodes: Vec<SPPFNode<'a>>,
 }
 
+// getters
 impl<'a> SPPF<'a> {
-  pub(crate) fn find(&mut self, prod: &'a [u32], range: Range<u32>) -> usize {
-    self.nodes.iter_mut().position(|x| x.prod.as_ptr() == prod.as_ptr() && x.range == range)
-      .unwrap_or_else(|| (self.nodes.len(), self.nodes.push(SPPFNode { prod, range, children: SmallVec::new() })).0)
-  }
+  #[inline(always)]
+  pub fn parser(&self) -> &'a Parser<'a> { self.parser }
+  #[inline(always)]
+  pub fn start(&self) -> u32 { self.start }
+  #[inline(always)]
+  pub fn tokens(&self) -> &Vec<u32> { &self.tokens }
+  #[inline(always)]
+  pub fn nodes(&self) -> &Vec<SPPFNode<'a>> { &self.nodes }
+}
 
-  pub fn print_dot(&self) -> String {
-    let ref id2token = self.parser.id2token();
-    let mut s = "digraph g {\n".to_owned();
-    let mut circles = 0;
-    for (idx, SPPFNode { prod, range, children }) in self.nodes.iter().enumerate() {
-      if !prod.is_empty() {
-        let _ = writeln!(s, r#"{}[shape=rect, label="{}, {:?}"]"#, idx, ShowProd(id2token, prod), range);
-        for ch in children {
-          if ch.len() == 1 { let _ = writeln!(s, "{} -> {}", idx, ch[0]); } else {
-            let _ = writeln!(s, "{} -> circle{}", idx, circles);
-            let _ = writeln!(s, r#"circle{}[shape=circle, label="", width=0.2]"#, circles);
-            for t in ch { let _ = writeln!(s, "circle{} -> {}", circles, t); }
-            circles += 1;
-          }
-        }
-      } else {
-        let _ = writeln!(s, r#"{}[shape=circle, label="{}"]"#, idx, id2token[self.tokens[range.start as usize] as usize]);
-      }
-    }
-    s.push('}');
-    s
+impl<'a> SPPF<'a> {
+  pub(crate) fn find(&mut self, prod: &'a [u32], range: Range<u32>) -> u32 {
+    self.nodes.iter_mut().position(|x| x.prod.as_ptr() == prod.as_ptr() && x.range == range)
+      .unwrap_or_else(|| (self.nodes.len(), self.nodes.push(SPPFNode { prod, range, children: SmallVec::new() })).0) as u32
   }
 
   pub fn iter(&self) -> Iter {
     let mut stk = Vec::new();
     for (idx, SPPFNode { prod, range, .. }) in self.nodes.iter().enumerate() {
       if prod.get(0) == Some(&self.start) && range.end == self.tokens.len() as u32 {
-        stk.push(State::_0 { node: idx, pos: (!0, &[]) });
+        stk.push(State::_0 { node: idx as u32, pos: ParentSibling { sib: std::ptr::null(), parent: !0, sib_len: 0 } });
       }
     }
     let tree = SPPF { parser: self.parser, start: self.start, tokens: self.tokens.clone(), nodes: Vec::new() };
@@ -60,16 +49,26 @@ impl<'a> SPPF<'a> {
   }
 }
 
-enum State<'a> {
-  _0 { node: usize, pos: (usize, &'a [u32]) },
+// this is logically a pair (&[u32], u32), except for its size is smaller on 64-bit platform
+// this pair means `(indices of siblings that is right to itself in `sppf`, index of parent in `tree`)
+// (for more detail, please refer to the comment on Iter::next)
+#[derive(Copy, Clone)]
+struct ParentSibling {
+  sib: *const u32,
+  sib_len: u32,
+  parent: u32,
+}
+
+enum State {
+  _0 { node: u32, pos: ParentSibling },
   _1,
-  _2 { node: usize, cur: usize, ch_idx: usize },
+  _2 { node: u32, cur: u32, ch_idx: u32 },
 }
 
 pub struct Iter<'a> {
   sppf: &'a SPPF<'a>,
-  stk: Vec<State<'a>>,
-  poses: Vec<(usize, &'a [u32])>,
+  stk: Vec<State>,
+  poses: Vec<ParentSibling>,
   tree: SPPF<'a>,
 }
 
@@ -85,7 +84,7 @@ impl<'a> Iter<'a> {
   // // `sppf` is the original sppf, the `children` in it may contain multiple choices
   // // `tree` is the target tree, we want to explore all the possibility in `sppf`, and generate concrete trees
   // // `node` is the index of the node that we are going to explore in `sppf`
-  // // `pos` is `(index of parent in `tree`, indices of siblings that is right to itself in `sppf`)`
+  // // `pos` is the `ParentSibling` information of current node
   // // `poses` is a stack of `pos`, when we reach a leaf in `sppf`, we lookup from top to bottom in `poses`
   // // and find the first one with `siblings` not empty, and go to explore the first sibling
   // fn dfs(node: usize, pos: (usize, &[u32]))
@@ -121,43 +120,46 @@ impl<'a> Iter<'a> {
     loop {
       match stk.pop() {
         Some(State::_0 { node, pos }) => unsafe {
-          let SPPFNode { prod, range, children } = sppf.nodes.get_unchecked(node);
-          let cur = tree.nodes.len();
+          let SPPFNode { prod, range, children } = get(&sppf.nodes, node);
+          let cur = tree.nodes.len() as u32;
           tree.nodes.push(SPPFNode { prod, range: range.clone(), children: SmallVec::new() });
-          if pos.0 != !0 {
-            let ch = &mut tree.nodes.get_unchecked_mut(pos.0).children.get_unchecked_mut(0);
-            let len = ch.len();
-            *ch.get_unchecked_mut(len - pos.1.len() - 1) = cur as u32;
+          if pos.parent != !0 {
+            let ch = get_mut(&mut get_mut(&mut tree.nodes, pos.parent).children, 0);
+            let len = ch.len() as u32;
+            *get_mut(ch, len - pos.sib_len - 1) = cur;
           }
           if children.is_empty() {
-            if let Some((parent, ch)) = poses.iter_mut().rfind(|(_, ch)| !ch.is_empty()) {
-              let parent = *parent;
-              let (fst, remain) = split1(ch);
-              *ch = remain;
+            if let Some(pos) = poses.iter_mut().rfind(|pos| pos.sib_len != 0) {
+              let fst = *pos.sib;
+              pos.sib = pos.sib.add(1);
+              pos.sib_len -= 1;
+              let pos = *pos;
               stk.push(State::_1);
-              stk.push(State::_0 { node: fst as usize, pos: (parent, remain) });
+              stk.push(State::_0 { node: fst, pos });
             } else {
               stk.push(State::_1);
               return Some(tree);
             }
           } else {
-            tree.nodes.get_unchecked_mut(cur).children.push(smallvec![0; prod.len() - 1]);
-            let (fst, remain) = split1(children.get_unchecked(0));
-            poses.push((cur, remain));
+            get_mut(&mut tree.nodes, cur).children.push(smallvec![0; prod.len() - 1]);
+            let (fst, remain) = split1(get::<SmallVec<_>>(children, 0));
+            let pos = ParentSibling { sib: remain.as_ptr(), sib_len: remain.len() as u32, parent: cur };
+            poses.push(pos);
             stk.push(State::_2 { node, cur, ch_idx: 0 });
-            stk.push(State::_0 { node: fst, pos: (cur, remain) });
+            stk.push(State::_0 { node: fst, pos });
           }
         }
         Some(State::_1) => { tree.nodes.pop(); }
         Some(State::_2 { node, cur, ch_idx }) => unsafe {
-          let n = sppf.nodes.get_unchecked(node);
+          let n = get(&sppf.nodes, node);
           poses.pop();
           let ch_idx = ch_idx + 1;
-          if ch_idx < n.children.len() {
-            let (fst, remain) = split1(n.children.get_unchecked(ch_idx));
-            poses.push((cur, remain));
+          if ch_idx < n.children.len() as u32 {
+            let (fst, remain) = split1(get::<SmallVec<_>>(&n.children, ch_idx));
+            let pos = ParentSibling { sib: remain.as_ptr(), sib_len: remain.len() as u32, parent: cur };
+            poses.push(pos);
             stk.push(State::_2 { node, cur, ch_idx });
-            stk.push(State::_0 { node: fst, pos: (cur, remain) });
+            stk.push(State::_0 { node: fst, pos });
           } else {
             tree.nodes.pop();
           }
@@ -165,16 +167,5 @@ impl<'a> Iter<'a> {
         None => return None,
       }
     }
-  }
-}
-
-pub(crate) struct ShowProd<'a>(pub &'a [&'a str], pub &'a [u32]);
-
-impl fmt::Display for ShowProd<'_> {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    let (lhs, rhs) = (self.1[0], &self.1[1..]);
-    write!(f, "{} ->", self.0[lhs as usize])?;
-    for &r in rhs { write!(f, " {}", self.0[r as usize])?; }
-    Ok(())
   }
 }

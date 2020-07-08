@@ -11,12 +11,12 @@ Product -> Factor
 Factor  -> ( Sum )
 Factor  -> Number
 "#).unwrap();
-  let sppf = p.parse(["Number", "+", "(", "Number", "*", "Number", "-", "Number", ")"].iter().copied(), "Sum").unwrap();
+  let (_, sppf) = p.parse(["Number", "+", "(", "Number", "*", "Number", "-", "Number", ")"].iter().copied(), "Sum").unwrap();
 
   let mut it = sppf.iter();
   let mut cnt = 0;
   while let Some(tree) = it.next() {
-    std::fs::write(format!("{}.dot", cnt), tree.print_dot()).unwrap();
+    std::fs::write(format!("{}.dot", cnt), format!("{}", tree)).unwrap();
     cnt += 1;
   }
 }
