@@ -40,8 +40,8 @@ impl<'a> SPPF<'a> {
   pub fn iter(&self) -> Iter {
     let mut stk = Vec::new();
     for (idx, SPPFNode { prod, range, .. }) in self.nodes.iter().enumerate() {
-      if prod.get(0) == Some(&self.start) && range.end == self.tokens.len() as u32 {
-        stk.push(State::_0 { node: idx as u32, pos: ParentSibling { sib: std::ptr::null(), parent: !0, sib_len: 0 } });
+      if prod.get(0) == Some(&self.start) && range.start == 0 && range.end == self.tokens.len() as u32 {
+        stk.push(State::_0 { node: idx as u32, parent: !0, ch_idx: 0 });
       }
     }
     let tree = SPPF { parser: self.parser, start: self.start, tokens: self.tokens.clone(), nodes: Vec::new() };
@@ -49,18 +49,8 @@ impl<'a> SPPF<'a> {
   }
 }
 
-// this is logically a pair (&[u32], u32), except for its size is smaller on 64-bit platform
-// this pair means `(indices of siblings that is right to itself in `sppf`, index of parent in `tree`)
-// (for more detail, please refer to the comment on Iter::next)
-#[derive(Copy, Clone)]
-struct ParentSibling {
-  sib: *const u32,
-  sib_len: u32,
-  parent: u32,
-}
-
 enum State {
-  _0 { node: u32, pos: ParentSibling },
+  _0 { node: u32, parent: u32, ch_idx: u32 },
   _1,
   _2 { node: u32, cur: u32, ch_idx: u32 },
 }
@@ -68,7 +58,7 @@ enum State {
 pub struct Iter<'a> {
   sppf: &'a SPPF<'a>,
   stk: Vec<State>,
-  poses: Vec<ParentSibling>,
+  poses: Vec<(u32, u32, u32)>,
   tree: SPPF<'a>,
 }
 
@@ -77,37 +67,33 @@ impl<'a> Iter<'a> {
   // each tree is represented by `SPPF`, with `children.len() <= 1` guaranteed (so that it is a determined tree)
   //
   // this function may be somewhat hard to understand, this is because it is transformed from a recursive function
-  // to a non-recursive one, based on heap-allocated stack and state machine
-  // the pseudo-code of the original recursive function is like:
-  // (implicit `self`, omitting type cast, use safe functions)
+  // to a non-recursive one based on heap-allocated stack and state machine
+  // the pseudo-code of the original recursive function is like (implicit `self`, omitting type cast, use safe functions):
   //
-  // // `sppf` is the original sppf, the `children` in it may contain multiple choices
-  // // `tree` is the target tree, we want to explore all the possibility in `sppf`, and generate concrete trees
-  // // `node` is the index of the node that we are going to explore in `sppf`
-  // // `pos` is the `ParentSibling` information of current node
-  // // `poses` is a stack of `pos`, when we reach a leaf in `sppf`, we lookup from top to bottom in `poses`
-  // // and find the first one with `siblings` not empty, and go to explore the first sibling
-  // fn dfs(node: usize, pos: (usize, &[u32]))
+  // `sppf`: original sppf, the `children` in it may contain multiple choices
+  // `tree`: target tree, we want to explore all the possibility in `sppf`, and generate concrete trees
+  // param `node`: index of the node that we are going to explore in `sppf`
+  // param `parent`: index of its parent in `tree` (when it has no parent, it is `!0`)
+  // param `ch_idx`: index of the pointer to self in `tree.nodes[parent].children[0]`
+  // `poses`: stack of `(node, parent, ch_idx)`, when we reach a leaf in `sppf`, we pop a pos and explore it
+  // fn dfs(u32 node, u32 parent, u32 ch_idx)
   //   let { prod, range, children } = sppf[node]
   //   let cur = tree.nodes.len()
   //   tree.nodes.push(SPPFNode { prod, range, SmallVec::new() })
   //   if pos.0 is valid // I use a special value !0 as the invalid value
-  //     let ch = tree.nodes[pos.0][0]
-  //     // this is the location that the node of `tree.nodes` in its parent's pointers
-  //     ch[ch.len() - pos.1.len() - 1] = cur
+  //     tree.nodes[pos.0].children[0][ch_idx] = cur
   //   if children.is_empty() { // leaf node, no more decision to make on this branch
-  //     if let Some((parent, ch)) = poses.iter_mut().rfind(|(_, ch)| !ch.is_empty()) {
-  //       let (fst, remain) = (ch[0], ch[1..])
-  //       *ch = remain
-  //       dfs(fst, (*parent, remain))
+  //     if let Some((node, parent, ch_idx)) = poses.pop() {
+  //       dfs(node, parent, ch_idx)
   //     else
   //       yield tree // this corresponds to the line `return Some(tree);`
   //   else
   //     tree.nodes[cur].children[0] = smallvec![0; prod.len() - 1] // tree.nodes[cur] is just pushed
   //     for ch in children
   //       let (fst, remain) = (ch[0], ch[1..])
-  //       poses.push((cur, remain))
-  //       dfs(fst, (cur, remain))
+  //       for (idx, &r) in remain.iter().enumerate().rev() // push siblings to `poses` reversely
+  //         poses.push((r, cur, idx + 1));
+  //       dfs(fst, cur, 0)
   //       poses.pop()
   //   tree.nodes.pop()
   //
@@ -119,47 +105,36 @@ impl<'a> Iter<'a> {
     let sppf = *sppf;
     loop {
       match stk.pop() {
-        Some(State::_0 { node, pos }) => unsafe {
+        Some(State::_0 { node, parent, ch_idx }) => unsafe {
           let SPPFNode { prod, range, children } = get(&sppf.nodes, node);
           let cur = tree.nodes.len() as u32;
           tree.nodes.push(SPPFNode { prod, range: range.clone(), children: SmallVec::new() });
-          if pos.parent != !0 {
-            let ch = get_mut(&mut get_mut(&mut tree.nodes, pos.parent).children, 0);
-            let len = ch.len() as u32;
-            *get_mut(ch, len - pos.sib_len - 1) = cur;
+          if parent != !0 {
+            *get_mut(get_mut::<SmallVec<_>>(&mut get_mut(&mut tree.nodes, parent).children, 0), ch_idx) = cur;
           }
           if children.is_empty() {
-            if let Some(pos) = poses.iter_mut().rfind(|pos| pos.sib_len != 0) {
-              let fst = *pos.sib;
-              pos.sib = pos.sib.add(1);
-              pos.sib_len -= 1;
-              let pos = *pos;
-              stk.push(State::_1);
-              stk.push(State::_0 { node: fst, pos });
+            stk.push(State::_1);
+            if let Some((node, parent, ch_idx)) = poses.pop() {
+              stk.push(State::_0 { node, parent, ch_idx });
             } else {
-              stk.push(State::_1);
               return Some(tree);
             }
           } else {
             get_mut(&mut tree.nodes, cur).children.push(smallvec![0; prod.len() - 1]);
-            let (fst, remain) = split1(get::<SmallVec<_>>(children, 0));
-            let pos = ParentSibling { sib: remain.as_ptr(), sib_len: remain.len() as u32, parent: cur };
-            poses.push(pos);
             stk.push(State::_2 { node, cur, ch_idx: 0 });
-            stk.push(State::_0 { node: fst, pos });
           }
         }
         Some(State::_1) => { tree.nodes.pop(); }
         Some(State::_2 { node, cur, ch_idx }) => unsafe {
           let n = get(&sppf.nodes, node);
-          poses.pop();
-          let ch_idx = ch_idx + 1;
           if ch_idx < n.children.len() as u32 {
-            let (fst, remain) = split1(get::<SmallVec<_>>(&n.children, ch_idx));
-            let pos = ParentSibling { sib: remain.as_ptr(), sib_len: remain.len() as u32, parent: cur };
-            poses.push(pos);
-            stk.push(State::_2 { node, cur, ch_idx });
-            stk.push(State::_0 { node: fst, pos });
+            let (fst, remain) = split1(get::<SmallVec<_>>(n.children.as_slice(), ch_idx));
+            poses.reserve(remain.len());
+            for (idx, &r) in remain.iter().enumerate().rev() {
+              poses.push((r, cur, idx as u32 + 1));
+            }
+            stk.push(State::_2 { node, cur, ch_idx: ch_idx + 1 });
+            stk.push(State::_0 { node: fst, parent: cur, ch_idx: 0 });
           } else {
             tree.nodes.pop();
           }
